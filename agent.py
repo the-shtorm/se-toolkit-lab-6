@@ -51,7 +51,10 @@ load_env_file(ENV_DOCKER_FILE)
 
 
 def get_settings() -> dict[str, str]:
-    """Get agent settings from environment variables."""
+    """Get agent settings from environment variables.
+    
+    Environment variables can be set via .env files or injected directly.
+    """
     llm_api_key = os.environ.get("LLM_API_KEY")
     llm_api_base = os.environ.get("LLM_API_BASE")
     llm_model = os.environ.get("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
@@ -61,7 +64,7 @@ def get_settings() -> dict[str, str]:
     agent_api_base_url = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
 
     if not llm_api_key or not llm_api_base:
-        raise ValueError("LLM_API_KEY and LLM_API_BASE must be set in .env.agent.secret")
+        raise ValueError("LLM_API_KEY and LLM_API_BASE must be set (via .env files or environment variables)")
 
     return {
         "llm_api_key": llm_api_key,
@@ -503,40 +506,53 @@ async def run_agentic_loop(question: str, settings: dict[str, str]) -> dict[str,
 
 async def main() -> int:
     """Main entry point for the agent."""
-    # Parse command-line arguments
-    if len(sys.argv) < 2:
-        print("Usage: uv run agent.py \"<question>\"", file=sys.stderr)
-        return 1
-
-    question = sys.argv[1]
-    print(f"Question: {question}", file=sys.stderr)
-
-    # Load settings
     try:
-        settings = get_settings()
-    except ValueError as e:
-        print(f"Error loading configuration: {e}", file=sys.stderr)
-        print("Make sure .env.agent.secret exists with required values.", file=sys.stderr)
-        return 1
+        # Parse command-line arguments
+        if len(sys.argv) < 2:
+            print("Usage: uv run agent.py \"<question>\"", file=sys.stderr)
+            print(json.dumps({"answer": "No question provided", "source": "", "tool_calls": []}))
+            return 1
 
-    # Run the agentic loop
-    try:
-        response = await run_agentic_loop(question, settings)
-    except httpx.HTTPStatusError as e:
-        print(f"HTTP error: {e.response.status_code}", file=sys.stderr)
-        print(f"Response: {e.response.text}", file=sys.stderr)
-        return 1
-    except httpx.RequestError as e:
-        print(f"Request error: {e}", file=sys.stderr)
-        return 1
+        question = sys.argv[1]
+        print(f"Question: {question}", file=sys.stderr)
+
+        # Load settings
+        try:
+            settings = get_settings()
+        except ValueError as e:
+            print(f"Error loading configuration: {e}", file=sys.stderr)
+            # Output valid JSON even on error (autochecker requirement)
+            print(json.dumps({"answer": f"Configuration error: {e}", "source": "", "tool_calls": []}))
+            return 1
+
+        # Run the agentic loop
+        try:
+            response = await run_agentic_loop(question, settings)
+        except httpx.HTTPStatusError as e:
+            print(f"HTTP error: {e.response.status_code}", file=sys.stderr)
+            print(f"Response: {e.response.text}", file=sys.stderr)
+            print(json.dumps({"answer": f"HTTP error: {e.response.status_code}", "source": "", "tool_calls": []}))
+            return 1
+        except httpx.RequestError as e:
+            print(f"Request error: {e}", file=sys.stderr)
+            print(json.dumps({"answer": f"Request error: {e}", "source": "", "tool_calls": []}))
+            return 1
+        except Exception as e:
+            print(f"Error in agentic loop: {e}", file=sys.stderr)
+            print(json.dumps({"answer": f"Error: {e}", "source": "", "tool_calls": []}))
+            return 1
+
+        # Output valid JSON to stdout
+        print(json.dumps(response))
+
+        return 0
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        # Catch-all for any unexpected errors
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        print(json.dumps({"answer": f"Unexpected error: {e}", "source": "", "tool_calls": []}))
         return 1
-
-    # Output valid JSON to stdout
-    print(json.dumps(response))
-
-    return 0
 
 
 if __name__ == "__main__":
