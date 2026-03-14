@@ -23,6 +23,7 @@ import httpx
 # Get the directory where agent.py is located
 AGENT_DIR = Path(__file__).parent
 ENV_FILE = AGENT_DIR / ".env.agent.secret"
+ENV_DOCKER_FILE = AGENT_DIR / ".env.docker.secret"
 
 # Maximum number of tool calls per question
 MAX_TOOL_CALLS = 10
@@ -44,8 +45,9 @@ def load_env_file(env_file: Path) -> None:
                 os.environ[key] = value
 
 
-# Load environment variables from .env.agent.secret
+# Load environment variables from .env.agent.secret and .env.docker.secret
 load_env_file(ENV_FILE)
+load_env_file(ENV_DOCKER_FILE)
 
 
 def get_settings() -> dict[str, str]:
@@ -53,6 +55,10 @@ def get_settings() -> dict[str, str]:
     llm_api_key = os.environ.get("LLM_API_KEY")
     llm_api_base = os.environ.get("LLM_API_BASE")
     llm_model = os.environ.get("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    
+    # Backend API settings for query_api tool
+    lms_api_key = os.environ.get("LMS_API_KEY", "")
+    agent_api_base_url = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
 
     if not llm_api_key or not llm_api_base:
         raise ValueError("LLM_API_KEY and LLM_API_BASE must be set in .env.agent.secret")
@@ -61,6 +67,8 @@ def get_settings() -> dict[str, str]:
         "llm_api_key": llm_api_key,
         "llm_api_base": llm_api_base,
         "llm_model": llm_model,
+        "lms_api_key": lms_api_key,
+        "agent_api_base_url": agent_api_base_url,
     }
 
 
@@ -139,6 +147,65 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def query_api(method: str, path: str, body: str | None = None, settings: dict | None = None) -> str:
+    """Call the backend API.
+
+    Args:
+        method: HTTP method (GET, POST, etc.)
+        path: API path (e.g., '/items/', '/analytics/completion-rate')
+        body: Optional JSON request body (for POST/PUT)
+        settings: Optional settings dict (for testing)
+
+    Returns:
+        JSON string with status_code and body, or an error message.
+    """
+    if settings is None:
+        try:
+            settings = get_settings()
+        except ValueError as e:
+            return f"Error: Configuration error - {e}"
+
+    api_base = settings.get("agent_api_base_url", "http://localhost:42002")
+    api_key = settings.get("lms_api_key", "")
+
+    # Build URL
+    url = f"{api_base.rstrip('/')}{path}"
+
+    # Build headers
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # Build request
+    try:
+        import httpx
+        with httpx.Client(timeout=30.0) as client:
+            if method.upper() == "GET":
+                response = client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                response = client.post(url, headers=headers, content=body or "{}")
+            elif method.upper() == "PUT":
+                response = client.put(url, headers=headers, content=body or "{}")
+            elif method.upper() == "DELETE":
+                response = client.delete(url, headers=headers)
+            else:
+                return f"Error: Unsupported HTTP method '{method}'"
+
+            result = {
+                "status_code": response.status_code,
+                "body": response.text
+            }
+            return json.dumps(result)
+    except httpx.ConnectError as e:
+        return f"Error: Cannot connect to API at {url} - {e}"
+    except httpx.TimeoutException as e:
+        return f"Error: API request timed out - {e}"
+    except Exception as e:
+        return f"Error: API request failed - {e}"
+
+
 # Tool definitions for the LLM
 TOOLS = [
     {
@@ -174,6 +241,31 @@ TOOLS = [
                 "required": ["path"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Call the backend API. Use for questions about the running system, data counts, API responses, or status codes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (GET, POST, PUT, DELETE)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API path (e.g., '/items/', '/analytics/completion-rate')"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body for POST/PUT requests"
+                    }
+                },
+                "required": ["method", "path"]
+            }
+        }
     }
 ]
 
@@ -181,31 +273,40 @@ TOOLS = [
 TOOL_FUNCTIONS = {
     "read_file": read_file,
     "list_files": list_files,
+    "query_api": query_api,
 }
 
-SYSTEM_PROMPT = """You are a documentation assistant for a software engineering lab. You have access to two tools:
+SYSTEM_PROMPT = """You are a documentation and system assistant for a software engineering lab.
 
-1. list_files: List files and directories in a directory
-2. read_file: Read the contents of a file
+You have access to three tools:
 
-To answer questions about the project documentation:
-1. First use list_files to explore the wiki directory structure
-2. Use read_file to read relevant files
-3. Find the specific section that answers the question
-4. Include the source reference in the format: wiki/filename.md#section-anchor
+1. list_files - List files and directories in a directory
+2. read_file - Read the contents of a file
+3. query_api - Call the backend API (for system data, counts, status codes, API behavior)
 
-Always provide a source reference when answering. The source should point to the specific file and section that contains the answer.
+To answer questions:
+- For wiki/documentation questions: use list_files to explore, then read_file to find answers
+- For source code questions: use list_files and read_file on the backend/ directory
+- For system facts (framework, ports, status codes): use query_api or read_file on source code
+- For data queries (item counts, scores): use query_api
+- For bug diagnosis: use query_api to reproduce the error, then read_file on source code to find the bug
 
-If you don't find the answer in the documentation, say so honestly."""
+Always provide source references when answering from files (format: wiki/filename.md#section-anchor or backend/path/file.py).
+For API queries, mention the endpoint used.
+
+If you don't find the answer, say so honestly."""
 
 
-def execute_tool(tool_name: str, args: dict[str, Any]) -> str:
+def execute_tool(tool_name: str, args: dict[str, Any], settings: dict | None = None) -> str:
     """Execute a tool and return the result."""
     if tool_name not in TOOL_FUNCTIONS:
         return f"Error: Unknown tool '{tool_name}'"
-    
+
     func = TOOL_FUNCTIONS[tool_name]
     try:
+        # query_api needs settings for authentication
+        if tool_name == "query_api":
+            return func(**args, settings=settings)
         return func(**args)
     except Exception as e:
         return f"Error executing {tool_name}: {e}"
@@ -220,8 +321,11 @@ def create_agent_response(content: str, source: str = "", tool_calls: list | Non
     }
 
 
-async def call_llm(messages: list[dict], settings: dict[str, str], tools: list | None = None) -> dict:
-    """Call the LLM API and return the response."""
+async def call_llm(messages: list[dict], settings: dict[str, str], tools: list | None = None, max_retries: int = 5) -> dict:
+    """Call the LLM API and return the response.
+    
+    Retries on 429 rate limit errors with exponential backoff.
+    """
     url = f"{settings['llm_api_base']}/chat/completions"
 
     headers = {
@@ -233,19 +337,43 @@ async def call_llm(messages: list[dict], settings: dict[str, str], tools: list |
         "model": settings["llm_model"],
         "messages": messages,
     }
-    
+
     if tools:
         payload["tools"] = tools
 
     print(f"Calling LLM at {url}...", file=sys.stderr)
 
     async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
+        for attempt in range(max_retries):
+            try:
+                response = await client.post(url, headers=headers, json=payload)
+                
+                # Handle rate limit errors with exponential backoff
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 10  # 10s, 20s, 30s, 40s, 50s
+                        print(f"Rate limited (429). Retrying in {wait_time}s... ({attempt + 1}/{max_retries})", file=sys.stderr)
+                        import asyncio
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        response.raise_for_status()  # Will raise HTTPStatusError
+                
+                response.raise_for_status()
+                data = response.json()
+                return data
+                
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429 and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 10
+                    print(f"Rate limited (429). Retrying in {wait_time}s... ({attempt + 1}/{max_retries})", file=sys.stderr)
+                    import asyncio
+                    await asyncio.sleep(wait_time)
+                    continue
+                raise
 
-        data = response.json()
-
-    return data
+    # Should not reach here, but just in case
+    raise RuntimeError("Failed to get LLM response after all retries")
 
 
 async def run_agentic_loop(question: str, settings: dict[str, str]) -> dict[str, Any]:
@@ -342,7 +470,7 @@ async def run_agentic_loop(question: str, settings: dict[str, str]) -> dict[str,
             print(f"Executing tool: {tool_name} with args: {args}", file=sys.stderr)
 
             # Execute the tool
-            result = execute_tool(tool_name, args)
+            result = execute_tool(tool_name, args, settings)
 
             # Track the last file read for source extraction
             if tool_name == "read_file" and not result.startswith("Error:"):
