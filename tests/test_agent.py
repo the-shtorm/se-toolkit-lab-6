@@ -14,10 +14,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 AGENT_PATH = PROJECT_ROOT / "agent.py"
 
 
-def run_agent(question: str, timeout: int = 120, max_retries: int = 2) -> dict:
+def run_agent(question: str, timeout: int = 180, max_retries: int = 3) -> dict:
     """Run the agent and return the parsed JSON response.
-    
-    Retries if the agent returns empty tool_calls (may happen due to LLM rate limiting).
+
+    Retries if the agent returns empty tool_calls or rate limit error (may happen due to LLM rate limiting).
     """
     for attempt in range(max_retries + 1):
         result = subprocess.run(
@@ -26,6 +26,13 @@ def run_agent(question: str, timeout: int = 120, max_retries: int = 2) -> dict:
             text=True,
             timeout=timeout,
         )
+
+        # Check for rate limit error - retry with longer delay
+        if result.returncode != 0 and "429" in result.stderr:
+            if attempt < max_retries:
+                time.sleep(5)  # Wait longer before retry for rate limit
+                continue
+            raise AssertionError(f"Agent hit rate limit after {max_retries + 1} attempts: {result.stderr[:200]}")
 
         # Check exit code
         if result.returncode != 0:
@@ -92,9 +99,42 @@ def test_agent_uses_list_files_for_directory_question():
     assert "list_files" in tool_names, "Expected list_files to be called for directory question"
 
 
+def test_agent_uses_read_file_for_source_code_question():
+    """Test that agent uses read_file tool when asked about backend source code."""
+    # Run the agent with a question that requires reading backend source code
+    data = run_agent("What Python web framework does the backend use?")
+
+    # Check that read_file was used
+    tool_names = [call.get("tool") for call in data["tool_calls"]]
+    assert "read_file" in tool_names, "Expected read_file to be called for source code question"
+
+    # Check that source references backend code
+    source = data.get("source", "")
+    assert "backend" in source.lower() or ".py" in source, \
+        f"Expected source to reference backend Python file, got: {source}"
+
+
+def test_agent_uses_query_api_for_data_question():
+    """Test that agent uses query_api tool when asked about database data."""
+    # Run the agent with a question that requires querying the API
+    data = run_agent("How many items are currently stored in the database?")
+
+    # Check that query_api was used
+    tool_names = [call.get("tool") for call in data["tool_calls"]]
+    assert "query_api" in tool_names, "Expected query_api to be called for data question"
+
+    # Check that answer contains a number
+    import re
+    answer = data.get("answer", "")
+    numbers = re.findall(r'\d+', answer)
+    assert len(numbers) > 0, f"Expected answer to contain a number, got: {answer}"
+
+
 if __name__ == "__main__":
     # Allow running tests directly
     test_agent_returns_valid_json_with_required_fields()
     test_agent_uses_read_file_for_wiki_question()
     test_agent_uses_list_files_for_directory_question()
+    test_agent_uses_read_file_for_source_code_question()
+    test_agent_uses_query_api_for_data_question()
     print("All tests passed!")
